@@ -1,8 +1,8 @@
 /**
  * @name ChannelLogger
  * @author jandewelf-sketch
- * @description Logs new, edited, and deleted messages from selected server channels to a log channel in your own server, using your own Discord bot.
- * @version 1.1.0
+ * @description Logs new, edited and deleted messages from chosen server channels to a log channel in your own server, using your own Discord bot.
+ * @version 1.1.1
  */
 
 const { Data, UI, ContextMenu, Webpack } = BdApi;
@@ -11,7 +11,7 @@ const COLORS = { create: 0x57f287, edit: 0xfee75c, delete: 0xed4245, info: 0x586
 const CACHE_LIMIT = 2000;
 const QUEUE_LIMIT = 1000;
 const API = "https://discord.com/api/v10";
-const UA = "DiscordBot (ChannelLogger, 1.1.0)";
+const UA = "DiscordBot (ChannelLogger, 1.1.1)";
 const TOKEN_RE = /^[\w-]{18,}\.[\w-]{5,}\.[\w-]{20,}$/;
 const ID_RE = /^\d{17,20}$/;
 
@@ -68,10 +68,10 @@ const findDispatcher = () => {
     );
 };
 
-// Requests are routed through BetterDiscord's own network layer, rather than the client's browser fetch.
+// Requests go through BetterDiscord's own network layer, not the client's browser fetch.
 const netFetch = (url, opts = {}) => {
     if (!BdApi.Net || typeof BdApi.Net.fetch !== "function") {
-        throw new Error("BdApi.Net.fetch ontbreekt. Update BetterDiscord.");
+        throw new Error("BdApi.Net.fetch is missing. Update BetterDiscord.");
     }
     return BdApi.Net.fetch(url, opts);
 };
@@ -120,8 +120,8 @@ module.exports = class ChannelLogger {
             .map(([n]) => n);
 
         if (missing.length) {
-            console.error("[ChannelLogger] Niet gevonden:", missing);
-            UI.showToast(`ChannelLogger: kon niet vinden: ${missing.join(", ")}`, { type: "error" });
+            console.error("[ChannelLogger] Not found:", missing);
+            UI.showToast(`ChannelLogger: could not find: ${missing.join(", ")}`, { type: "error" });
             this.running = false;
             return;
         }
@@ -178,7 +178,7 @@ module.exports = class ChannelLogger {
         return (t || "").trim().replace(/^Bot\s+/i, "");
     }
 
-    // The first part of a bot token is the Base64-encoded bot ID.
+    // The first part of a bot token is the base64-encoded bot ID.
     refreshBotId() {
         this.botUserId = null;
         try {
@@ -195,22 +195,22 @@ module.exports = class ChannelLogger {
     /* ---------- filters ---------- */
 
     isMonitored(channelId) {
-        if (channelId === (this.settings.logChannelId || "").trim()) return false; // nooit het logkanaal zelf
+        if (channelId === (this.settings.logChannelId || "").trim()) return false; // never the log channel itself
         const channel = this.ChannelStore.getChannel(channelId);
-        if (!channel || !channel.guild_id) return false; // geen DM's
+        if (!channel || !channel.guild_id) return false; // no DMs
         const { channels, guilds } = this.settings;
         if (channels[channelId] || guilds[channel.guild_id]) return true;
         if (channel.parent_id) {
-            if (channels[channel.parent_id]) return true; // kanaal of categorie als ouder
+            if (channels[channel.parent_id]) return true; // channel or category as parent
             const parent = this.ChannelStore.getChannel(channel.parent_id);
-            if (parent?.parent_id && channels[parent.parent_id]) return true; // thread in kanaal in categorie
+            if (parent?.parent_id && channels[parent.parent_id]) return true; // thread in a channel in a category
         }
         return false;
     }
 
     passesAuthorFilters(author) {
         if (!author) return true;
-        if (this.botUserId && author.id === this.botUserId) return false; // voorkom loops
+        if (this.botUserId && author.id === this.botUserId) return false; // prevent loops
         if (this.settings.ignoreBots && author.bot) return false;
         if (this.settings.ignoreSelf && author.id === this.UserStore.getCurrentUser()?.id) return false;
         return true;
@@ -253,9 +253,9 @@ module.exports = class ChannelLogger {
         if (!this.passesAuthorFilters(author)) return;
 
         if (cached) {
-            if (cached.content === msg.content) return; // geen echte bewerking
+            if (cached.content === msg.content) return; // not a real edit
         } else if (!msg.edited_timestamp) {
-            return; // embed-update zonder bewerking
+            return; // embed update without an edit
         }
 
         const old = cached ? cached.content : null;
@@ -283,7 +283,7 @@ module.exports = class ChannelLogger {
             if (!this.passesAuthorFilters(cached.author)) return;
             if (!this.matchesKeywords(cached.content)) return;
         } else if (this.settings.keywords.trim()) {
-            return; // zonder cache kunnen we niet op trefwoorden filteren
+            return; // without a cache we cannot filter on keywords
         }
 
         this.enqueue(
@@ -323,28 +323,28 @@ module.exports = class ChannelLogger {
         const channel = this.ChannelStore.getChannel(channelId);
         const guild = channel?.guild_id ? this.GuildStore.getGuild(channel.guild_id) : null;
         const author = msg.author;
-        const authorName = author ? author.global_name || author.username : "Onbekende gebruiker";
+        const authorName = author ? author.global_name || author.username : "Unknown user";
 
         const stickerText = (stickers || []).map((s) => `*(sticker: ${s.name})*`).join(" ");
-        const placeholder = "*(geen tekst — embed, bijlage of sticker)*";
+        const placeholder = "*(no text — embed, attachment or sticker)*";
         let description;
 
         if (kind === "edit") {
-            const oldText = old === null ? "*(onbekend — stond niet in cache)*" : cut(old || "*(leeg)*", 1800);
-            description = `**Nieuw**\n${cut(content || placeholder, 1800)}\n\n**Oud**\n${oldText}`;
+            const oldText = old === null ? "*(unknown — not in cache)*" : cut(old || "*(empty)*", 1800);
+            description = `**New**\n${cut(content || placeholder, 1800)}\n\n**Old**\n${oldText}`;
         } else if (kind === "delete") {
-            description = content === null ? "*(inhoud onbekend — bericht stond niet in cache)*" : cut(content || placeholder, 3800);
+            description = content === null ? "*(content unknown — message was not in cache)*" : cut(content || placeholder, 3800);
         } else {
             description = cut([content, stickerText].filter(Boolean).join("\n") || placeholder, 3800);
         }
 
         const embed = {
-            title: { create: "Nieuw bericht", edit: "Bericht bewerkt", delete: "Bericht verwijderd" }[kind],
+            title: { create: "New message", edit: "Message edited", delete: "Message deleted" }[kind],
             description,
             color: COLORS[kind],
             author: { name: cut(authorName, 200), icon_url: this.avatarUrl(author) },
             footer: {
-                text: cut(`${guild?.name ?? "Onbekende server"} • #${channel?.name ?? channelId}${author?.id ? ` • ID ${author.id}` : ""}`, 500),
+                text: cut(`${guild?.name ?? "Unknown server"} • #${channel?.name ?? channelId}${author?.id ? ` • ID ${author.id}` : ""}`, 500),
             },
             timestamp: kind === "delete" ? new Date().toISOString() : msg.edited_timestamp || msg.timestamp || new Date().toISOString(),
         };
@@ -354,8 +354,8 @@ module.exports = class ChannelLogger {
         }
 
         if (attachments?.length) {
-            const lines = attachments.map((a) => `[${a.filename || "bijlage"}](${a.url})`).join("\n");
-            embed.fields = [{ name: "Bijlagen", value: cut(lines, 1000) }];
+            const lines = attachments.map((a) => `[${a.filename || "attachment"}](${a.url})`).join("\n");
+            embed.fields = [{ name: "Attachments", value: cut(lines, 1000) }];
             const img = attachments.find((a) => a.content_type?.startsWith("image/"));
             if (img) embed.image = { url: img.url };
         }
@@ -363,7 +363,7 @@ module.exports = class ChannelLogger {
         return embed;
     }
 
-    /* ---------- verzenden via de bot ---------- */
+    /* ---------- sending via the bot ---------- */
 
     botHeaders() {
         return {
@@ -377,7 +377,7 @@ module.exports = class ChannelLogger {
         if (!this.isConfigured()) {
             if (!this.warnedNotConfigured) {
                 this.warnedNotConfigured = true;
-                UI.showToast("ChannelLogger: stel eerst een geldige bot-token en kanaal-ID in.", { type: "warning" });
+                UI.showToast("ChannelLogger: set a valid bot token and channel ID first.", { type: "warning" });
             }
             return;
         }
@@ -388,9 +388,9 @@ module.exports = class ChannelLogger {
     }
 
     hint(status) {
-        if (status === 401) return "Bot-token ongeldig of ingetrokken.";
-        if (status === 403) return "De bot heeft geen toegang of rechten in het logkanaal (Kanaal bekijken, Berichten sturen, Embeds insluiten).";
-        if (status === 404) return "Logkanaal niet gevonden. Klopt het kanaal-ID?";
+        if (status === 401) return "Bot token invalid or revoked.";
+        if (status === 403) return "The bot has no access or permissions in the log channel (View Channels, Send Messages, Embed Links).";
+        if (status === 404) return "Log channel not found. Is the channel ID correct?";
         return "";
     }
 
@@ -421,10 +421,10 @@ module.exports = class ChannelLogger {
                     if (failures >= 3 || res.fatal) {
                         const extra = this.hint(res.status);
                         UI.showToast(
-                            `ChannelLogger: versturen mislukt${res.status ? ` (HTTP ${res.status})` : ""}${res.detail ? `: ${res.detail}` : ""}${extra ? ` — ${extra}` : ""}`,
+                            `ChannelLogger: sending failed${res.status ? ` (HTTP ${res.status})` : ""}${res.detail ? `: ${res.detail}` : ""}${extra ? ` — ${extra}` : ""}`,
                             { type: "error", timeout: 10000 }
                         );
-                        failures = 0; // batch laten vallen
+                        failures = 0; // drop the batch
                     } else {
                         this.queue.unshift(...batch);
                         await sleep(3000);
@@ -456,12 +456,12 @@ module.exports = class ChannelLogger {
                 let detail = parsed?.message || (raw || "").replace(/\s+/g, " ").slice(0, 150);
                 if (parsed?.code) detail += ` (code ${parsed.code})`;
                 if (parsed?.errors) detail += " " + JSON.stringify(parsed.errors).slice(0, 200);
-                console.error("[ChannelLogger] Verzenden mislukt", res.status, raw.slice(0, 500));
+                console.error("[ChannelLogger] Sending failed", res.status, raw.slice(0, 500));
                 return { ok: false, status: res.status, detail, fatal: res.status >= 400 && res.status < 500 };
             }
             return { ok: true };
         } catch (err) {
-            console.error("[ChannelLogger] netwerkfout", err);
+            console.error("[ChannelLogger] network error", err);
             return { ok: false, fatal: true, detail: String(err?.message || err) };
         }
     }
@@ -476,7 +476,7 @@ module.exports = class ChannelLogger {
             ContextMenu.buildItem({ type: "separator" }),
             ContextMenu.buildItem({
                 type: "toggle",
-                label: channel.type === 4 ? "Log deze categorie" : "Log dit kanaal",
+                label: channel.type === 4 ? "Log this category" : "Log this channel",
                 checked: !!this.settings.channels[channel.id],
                 action: () => this.toggleChannel(channel),
             })
@@ -491,7 +491,7 @@ module.exports = class ChannelLogger {
             ContextMenu.buildItem({ type: "separator" }),
             ContextMenu.buildItem({
                 type: "toggle",
-                label: "Log hele server",
+                label: "Log whole server",
                 checked: !!this.settings.guilds[guild.id],
                 action: () => this.toggleGuild(guild),
             })
@@ -502,12 +502,12 @@ module.exports = class ChannelLogger {
         const label = `${channel.type === 4 ? "📁 " : "#"}${channel.name}`;
         if (this.settings.channels[channel.id]) {
             delete this.settings.channels[channel.id];
-            UI.showToast(`Logging gestopt: ${label}`, { type: "info" });
+            UI.showToast(`Logging stopped: ${label}`, { type: "info" });
         } else {
             const guild = this.GuildStore.getGuild(channel.guild_id);
             this.settings.channels[channel.id] = { label, guildName: guild?.name || "?" };
-            UI.showToast(`Logging gestart: ${label}`, { type: "success" });
-            if (!this.isConfigured()) UI.showToast("Let op: bot-token of kanaal-ID is nog niet ingesteld.", { type: "warning" });
+            UI.showToast(`Logging started: ${label}`, { type: "success" });
+            if (!this.isConfigured()) UI.showToast("Note: bot token or channel ID is not set yet.", { type: "warning" });
         }
         this.save();
     }
@@ -515,11 +515,11 @@ module.exports = class ChannelLogger {
     toggleGuild(guild) {
         if (this.settings.guilds[guild.id]) {
             delete this.settings.guilds[guild.id];
-            UI.showToast(`Logging gestopt: ${guild.name}`, { type: "info" });
+            UI.showToast(`Logging stopped: ${guild.name}`, { type: "info" });
         } else {
             this.settings.guilds[guild.id] = { label: guild.name };
-            UI.showToast(`Logging gestart voor hele server: ${guild.name}`, { type: "success" });
-            if (!this.isConfigured()) UI.showToast("Let op: bot-token of kanaal-ID is nog niet ingesteld.", { type: "warning" });
+            UI.showToast(`Logging started for whole server: ${guild.name}`, { type: "success" });
+            if (!this.isConfigured()) UI.showToast("Note: bot token or channel ID is not set yet.", { type: "warning" });
         }
         this.save();
     }
@@ -538,32 +538,32 @@ module.exports = class ChannelLogger {
         const render = () => {
             root.innerHTML = "";
 
-            // Bot-token (verborgen invoer)
-            const tokenInput = h("input", { type: "password", value: this.settings.botToken, placeholder: "Bot-token", style: inputStyle, autocomplete: "off" });
+            // Bot token (hidden input)
+            const tokenInput = h("input", { type: "password", value: this.settings.botToken, placeholder: "Bot token", style: inputStyle, autocomplete: "off" });
             tokenInput.addEventListener("change", () => {
                 this.settings.botToken = this.cleanToken(tokenInput.value);
                 tokenInput.value = this.settings.botToken;
                 this.save();
-                if (this.settings.botToken && !TOKEN_RE.test(this.settings.botToken)) UI.showToast("Dit lijkt geen geldige bot-token.", { type: "error" });
+                if (this.settings.botToken && !TOKEN_RE.test(this.settings.botToken)) UI.showToast("This does not look like a valid bot token.", { type: "error" });
             });
 
-            // Kanaal-ID
-            const chanInput = h("input", { type: "text", value: this.settings.logChannelId, placeholder: "ID van je logkanaal", style: inputStyle });
+            // Channel ID
+            const chanInput = h("input", { type: "text", value: this.settings.logChannelId, placeholder: "ID of your log channel", style: inputStyle });
             chanInput.addEventListener("change", () => {
                 this.settings.logChannelId = chanInput.value.trim();
                 chanInput.value = this.settings.logChannelId;
                 this.save();
-                if (this.settings.logChannelId && !ID_RE.test(this.settings.logChannelId)) UI.showToast("Dit lijkt geen geldig kanaal-ID.", { type: "error" });
+                if (this.settings.logChannelId && !ID_RE.test(this.settings.logChannelId)) UI.showToast("This does not look like a valid channel ID.", { type: "error" });
             });
 
-            const testBtn = h("button", { style: btnStyle, onclick: () => this.sendTest() }, "Stuur test");
+            const testBtn = h("button", { style: btnStyle, onclick: () => this.sendTest() }, "Send test");
             const diagBtn = h(
                 "button",
                 {
                     style: btnStyle,
                     onclick: async (ev) => {
                         ev.target.disabled = true;
-                        ev.target.textContent = "Bezig…";
+                        ev.target.textContent = "Working…";
                         await this.runDiagnose();
                         render();
                     },
@@ -572,12 +572,12 @@ module.exports = class ChannelLogger {
             );
 
             root.append(
-                h("div", { style: headStyle }, "Bot-token"),
+                h("div", { style: headStyle }, "Bot token"),
                 tokenInput,
-                h("div", { style: noteStyle }, "Staat leesbaar in de plugin-data op je computer. Deel hem met niemand en reset hem in het Developer Portal als hij lekt."),
-                h("div", { style: headStyle }, "Kanaal-ID van je logkanaal"),
+                h("div", { style: noteStyle }, "Stored unencrypted in the plugin data on your computer. Share it with no one and reset it in the Developer Portal if it leaks."),
+                h("div", { style: headStyle }, "Channel ID of your log channel"),
                 h("div", { style: "display:flex;align-items:center" }, chanInput, testBtn, diagBtn),
-                h("div", { style: noteStyle }, "Zet Ontwikkelaarsmodus aan, rechtsklik op het logkanaal en kies 'Kanaal-ID kopiëren'."),
+                h("div", { style: noteStyle }, "Turn on Developer Mode, right-click the log channel and choose 'Copy Channel ID'."),
                 this.diagText
                     ? h("pre", { style: "white-space:pre-wrap;user-select:text;margin-top:8px;padding:8px;border-radius:4px;font-size:12px;background:var(--background-tertiary,#1e1f22)" }, this.diagText)
                     : ""
@@ -592,19 +592,19 @@ module.exports = class ChannelLogger {
                 return h("label", { style: "display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer" }, cb, label);
             };
             root.append(
-                h("div", { style: headStyle }, "Opties"),
-                toggle("logEdits", "Bewerkte berichten loggen"),
-                toggle("logDeletes", "Verwijderde berichten loggen"),
-                toggle("ignoreBots", "Berichten van bots negeren"),
-                toggle("ignoreSelf", "Mijn eigen berichten negeren")
+                h("div", { style: headStyle }, "Options"),
+                toggle("logEdits", "Log edited messages"),
+                toggle("logDeletes", "Log deleted messages"),
+                toggle("ignoreBots", "Ignore messages from bots"),
+                toggle("ignoreSelf", "Ignore my own messages")
             );
 
-            const kw = h("input", { type: "text", value: this.settings.keywords, placeholder: "bv. giveaway, update (leeg = alles loggen)", style: inputStyle });
+            const kw = h("input", { type: "text", value: this.settings.keywords, placeholder: "e.g. giveaway, update (empty = log everything)", style: inputStyle });
             kw.addEventListener("change", () => {
                 this.settings.keywords = kw.value;
                 this.save();
             });
-            root.append(h("div", { style: headStyle }, "Trefwoorden (komma-gescheiden)"), kw);
+            root.append(h("div", { style: headStyle }, "Keywords (comma-separated)"), kw);
 
             const list = (title, obj, labelFn, key) => {
                 const ids = Object.keys(obj);
@@ -614,14 +614,14 @@ module.exports = class ChannelLogger {
                               "div",
                               { style: "display:flex;justify-content:space-between;align-items:center;padding:4px 0" },
                               h("span", {}, labelFn(obj[id])),
-                              h("button", { style: btnStyle, onclick: () => { delete this.settings[key][id]; this.save(); render(); } }, "Verwijder")
+                              h("button", { style: btnStyle, onclick: () => { delete this.settings[key][id]; this.save(); render(); } }, "Remove")
                           )
                       )
-                    : [h("div", { style: "opacity:.7" }, "Nog niets. Rechtsklik op een kanaal of server.")];
+                    : [h("div", { style: "opacity:.7" }, "Nothing yet. Right-click a channel or server.")];
                 root.append(h("div", { style: headStyle }, title), ...items);
             };
-            list("Gelogde kanalen / categorieën", this.settings.channels, (c) => `${c.guildName} › ${c.label}`, "channels");
-            list("Volledig gelogde servers", this.settings.guilds, (g) => g.label, "guilds");
+            list("Logged channels / categories", this.settings.channels, (c) => `${c.guildName} › ${c.label}`, "channels");
+            list("Fully logged servers", this.settings.guilds, (g) => g.label, "guilds");
         };
 
         render();
@@ -631,10 +631,10 @@ module.exports = class ChannelLogger {
     /* ---------- test & diagnose ---------- */
 
     sendTest() {
-        if (!this.running) return UI.showToast("Plugin is niet actief.", { type: "error" });
+        if (!this.running) return UI.showToast("Plugin is not running.", { type: "error" });
         this.enqueue({
             title: "ChannelLogger test",
-            description: "Als je dit ziet, werkt de bot.",
+            description: "If you see this, the bot works.",
             color: COLORS.info,
             timestamp: new Date().toISOString(),
         });
@@ -643,8 +643,8 @@ module.exports = class ChannelLogger {
     async runDiagnose() {
         const lines = [];
         const add = (t) => lines.push(t);
-        add(`Plugin: ${this.meta?.version || "?"} | BetterDiscord: ${BdApi.version ?? "onbekend"} | Net.fetch: ${typeof BdApi.Net?.fetch}`);
-        add(`Token geldig van vorm: ${TOKEN_RE.test(this.cleanToken(this.settings.botToken))} | Kanaal-ID geldig van vorm: ${ID_RE.test((this.settings.logChannelId || "").trim())}`);
+        add(`Plugin: ${this.meta?.version || "?"} | BetterDiscord: ${BdApi.version ?? "unknown"} | Net.fetch: ${typeof BdApi.Net?.fetch}`);
+        add(`Token format valid: ${TOKEN_RE.test(this.cleanToken(this.settings.botToken))} | Channel ID format valid: ${ID_RE.test((this.settings.logChannelId || "").trim())}`);
 
         const oneLine = (t) => String(t).replace(/\s+/g, " ").slice(0, 150);
         const attempt = async (label, fn, fmt) => {
@@ -654,7 +654,7 @@ module.exports = class ChannelLogger {
                 try { t = await r.text(); } catch (_) {}
                 add(`${label}: HTTP ${r.status} ${fmt ? fmt(t) : oneLine(t)}`);
             } catch (e) {
-                add(`${label}: FOUT ${e?.name || ""}: ${e?.message || e}`);
+                add(`${label}: ERROR ${e?.name || ""}: ${e?.message || e}`);
             }
         };
         const json = (t) => { try { return JSON.parse(t); } catch (_) { return null; } };
@@ -662,26 +662,26 @@ module.exports = class ChannelLogger {
         if (typeof BdApi.Net?.fetch === "function") {
             if (this.isConfigured()) {
                 const id = this.settings.logChannelId.trim();
-                await attempt("A. Wie is de bot (GET /users/@me)", () => netFetch(`${API}/users/@me`, { headers: this.botHeaders() }), (t) => {
+                await attempt("A. Who is the bot (GET /users/@me)", () => netFetch(`${API}/users/@me`, { headers: this.botHeaders() }), (t) => {
                     const j = json(t);
                     return j?.username ? `bot=${j.username}` : oneLine(t);
                 });
-                await attempt("B. Logkanaal opzoeken (GET /channels/{id})", () => netFetch(`${API}/channels/${id}`, { headers: this.botHeaders() }), (t) => {
+                await attempt("B. Look up log channel (GET /channels/{id})", () => netFetch(`${API}/channels/${id}`, { headers: this.botHeaders() }), (t) => {
                     const j = json(t);
-                    return j?.name ? `kanaal=#${j.name} type=${j.type}` : oneLine(t);
+                    return j?.name ? `channel=#${j.name} type=${j.type}` : oneLine(t);
                 });
                 await attempt(
-                    "C. Testbericht plaatsen (POST /channels/{id}/messages)",
+                    "C. Post test message (POST /channels/{id}/messages)",
                     () =>
                         netFetch(`${API}/channels/${id}/messages`, {
                             method: "POST",
                             headers: this.botHeaders(),
-                            body: JSON.stringify({ embeds: [{ title: "ChannelLogger diagnose", description: "Dit verzoek kwam door.", color: COLORS.info }] }),
+                            body: JSON.stringify({ embeds: [{ title: "ChannelLogger diagnose", description: "This request went through.", color: COLORS.info }] }),
                         }),
-                    (t) => (json(t)?.id ? "bericht geplaatst" : oneLine(t))
+                    (t) => (json(t)?.id ? "message posted" : oneLine(t))
                 );
             } else {
-                add("Vul eerst een geldige bot-token en kanaal-ID in.");
+                add("Fill in a valid bot token and channel ID first.");
             }
         }
 
