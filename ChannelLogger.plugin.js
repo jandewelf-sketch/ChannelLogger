@@ -1,8 +1,8 @@
 /**
  * @name ChannelLogger
  * @author jandewelf-sketch
- * @description Logs new, edited and deleted messages from chosen server channels to a log channel in your own server, using your own Discord bot.
- * @version 1.1.1
+ * @description Logs new, edited and deleted messages from chosen server channels to one or more log channels in your own server, using your own Discord bot.
+ * @version 1.2.0
  */
 
 const { Data, UI, ContextMenu, Webpack } = BdApi;
@@ -11,7 +11,7 @@ const COLORS = { create: 0x57f287, edit: 0xfee75c, delete: 0xed4245, info: 0x586
 const CACHE_LIMIT = 2000;
 const QUEUE_LIMIT = 1000;
 const API = "https://discord.com/api/v10";
-const UA = "DiscordBot (ChannelLogger, 1.1.1)";
+const UA = "DiscordBot (ChannelLogger, 1.2.0)";
 const TOKEN_RE = /^[\w-]{18,}\.[\w-]{5,}\.[\w-]{20,}$/;
 const ID_RE = /^\d{17,20}$/;
 
@@ -23,6 +23,7 @@ const embedSize = (e) =>
     (e.author?.name?.length || 0) +
     (e.footer?.text?.length || 0) +
     (e.fields || []).reduce((n, f) => n + f.name.length + f.value.length, 0);
+const newKey = () => "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
 
 const h = (tag, attrs = {}, ...kids) => {
     const el = document.createElement(tag);
@@ -82,18 +83,21 @@ module.exports = class ChannelLogger {
         this.name = meta?.name || "ChannelLogger";
         this.defaults = {
             botToken: "",
-            logChannelId: "",
+            destinations: {}, // key -> { name, channelId }
+            defaultDest: "",
+            eventRoutes: { edit: "", delete: "" }, // event -> destination key ("" = no override)
+            keywordRoutes: [], // [{ keywords, dest }]
             ignoreBots: false,
             ignoreSelf: false,
             logEdits: true,
             logDeletes: true,
             keywords: "",
-            channels: {}, // id -> { label, guildName }
-            guilds: {}, // id -> { label }
+            channels: {}, // id -> { label, guildName, dest }
+            guilds: {}, // id -> { label, dest }
         };
         this.cache = new Map();
-        this.queue = [];
-        this.pumping = false;
+        this.queues = new Map(); // log channel id -> { name, items: [] }
+        this.pumping = new Set();
         this.running = false;
         this.unpatches = [];
         this.warnedNotConfigured = false;
@@ -153,6 +157,7 @@ module.exports = class ChannelLogger {
         }
         this.unpatches = [];
         this.cache.clear();
+        this.queues.clear();
     }
 
     safe(fn) {
@@ -163,49 +168,89 @@ module.exports = class ChannelLogger {
 
     loadSettings() {
         const saved = Data.load(this.name, "settings") || {};
-        this.settings = Object.assign({}, this.defaults, saved);
-        this.settings.channels = this.settings.channels || {};
-        this.settings.guilds = this.settings.guilds || {};
-        this.refreshBotId();
+        const s = Object.assign({}, this.defaults, saved);
+        s.channels = s.channels || {};
+        s.guilds = s.guilds || {};
+        s.destinations = s.destinations || {};
+        s.keywordRoutes = Array.isArray(s.keywordRoutes) ? s.keywordRoutes : [];
+        s.eventRoutes = Object.assign({ edit: "", delete: "" }, s.eventRoutes || {});
+
+        // Migrate from the single log channel of version 1.1.x.
+        if (saved.logChannelId && !Object.keys(s.destinations).length) {
+            s.destinations.main = { name: "Main", channelId: String(saved.logChannelId).trim() };
+            s.defaultDest = "main";
+        }
+        delete s.logChannelId;
+
+        this.settings = s;
+        this.normalize();
+        this.refreshDerived();
     }
 
     save() {
+        this.normalize();
         Data.save(this.name, "settings", this.settings);
-        this.refreshBotId();
+        this.refreshDerived();
+    }
+
+    // Keep references to destinations consistent.
+    normalize() {
+        const s = this.settings;
+        const keys = Object.keys(s.destinations);
+        if (!s.destinations[s.defaultDest]) s.defaultDest = keys[0] || "";
+        for (const ev of ["edit", "delete"]) if (s.eventRoutes[ev] && !s.destinations[s.eventRoutes[ev]]) s.eventRoutes[ev] = "";
+        s.keywordRoutes = s.keywordRoutes.filter((r) => s.destinations[r.dest]);
+        for (const e of [...Object.values(s.channels), ...Object.values(s.guilds)]) {
+            if (e.dest && !s.destinations[e.dest]) e.dest = "";
+        }
     }
 
     cleanToken(t) {
         return (t || "").trim().replace(/^Bot\s+/i, "");
     }
 
-    // The first part of a bot token is the base64-encoded bot ID.
-    refreshBotId() {
+    refreshDerived() {
+        // The first part of a bot token is the base64-encoded bot ID.
         this.botUserId = null;
         try {
             const part = this.cleanToken(this.settings.botToken).split(".")[0];
             const id = atob(part.replace(/-/g, "+").replace(/_/g, "/"));
             if (/^\d+$/.test(id)) this.botUserId = id;
         } catch (_) {}
+
+        this.destIds = new Set(
+            Object.values(this.settings.destinations)
+                .map((d) => (d.channelId || "").trim())
+                .filter(Boolean)
+        );
     }
 
     isConfigured() {
-        return TOKEN_RE.test(this.cleanToken(this.settings.botToken)) && ID_RE.test((this.settings.logChannelId || "").trim());
+        return (
+            TOKEN_RE.test(this.cleanToken(this.settings.botToken)) &&
+            Object.values(this.settings.destinations).some((d) => ID_RE.test((d.channelId || "").trim()))
+        );
     }
 
-    /* ---------- filters ---------- */
+    destName(key) {
+        return this.settings.destinations[key]?.name || "?";
+    }
 
-    isMonitored(channelId) {
-        if (channelId === (this.settings.logChannelId || "").trim()) return false; // never the log channel itself
+    /* ---------- filters and routing ---------- */
+
+    // Returns the settings entry of the most specific logged source (channel, category or server), or null.
+    getSource(channelId) {
+        if (this.destIds.has(channelId)) return null; // never log the log channels themselves
         const channel = this.ChannelStore.getChannel(channelId);
-        if (!channel || !channel.guild_id) return false; // no DMs
+        if (!channel || !channel.guild_id) return null; // no DMs
         const { channels, guilds } = this.settings;
-        if (channels[channelId] || guilds[channel.guild_id]) return true;
+        if (channels[channelId]) return channels[channelId];
         if (channel.parent_id) {
-            if (channels[channel.parent_id]) return true; // channel or category as parent
+            if (channels[channel.parent_id]) return channels[channel.parent_id]; // channel or category as parent
             const parent = this.ChannelStore.getChannel(channel.parent_id);
-            if (parent?.parent_id && channels[parent.parent_id]) return true; // thread in a channel in a category
+            if (parent?.parent_id && channels[parent.parent_id]) return channels[parent.parent_id]; // thread in a channel in a category
         }
-        return false;
+        return guilds[channel.guild_id] || null;
     }
 
     passesAuthorFilters(author) {
@@ -216,14 +261,37 @@ module.exports = class ChannelLogger {
         return true;
     }
 
-    matchesKeywords(text) {
-        const kws = this.settings.keywords
+    kwList(str) {
+        return (str || "")
             .split(",")
             .map((k) => k.trim().toLowerCase())
             .filter(Boolean);
+    }
+
+    // Global filter: with no keywords everything passes.
+    matchesKeywords(text) {
+        const kws = this.kwList(this.settings.keywords);
         if (!kws.length) return true;
         const t = (text || "").toLowerCase();
         return kws.some((k) => t.includes(k));
+    }
+
+    // Priority: keyword routes, then event override (edit/delete), then the source's destination, then the default.
+    resolveDest(source, kind, ...texts) {
+        const { destinations, keywordRoutes, eventRoutes, defaultDest } = this.settings;
+        const hay = texts.filter((t) => typeof t === "string").join("\n").toLowerCase();
+        if (hay) {
+            for (const r of keywordRoutes) {
+                const kws = this.kwList(r.keywords);
+                if (destinations[r.dest] && kws.length && kws.some((k) => hay.includes(k))) return r.dest;
+            }
+        }
+        if (kind !== "create") {
+            const k = eventRoutes[kind];
+            if (k && destinations[k]) return k;
+        }
+        if (source?.dest && destinations[source.dest]) return source.dest;
+        return destinations[defaultDest] ? defaultDest : Object.keys(destinations)[0] || null;
     }
 
     /* ---------- event handlers ---------- */
@@ -233,12 +301,16 @@ module.exports = class ChannelLogger {
         const msg = e.message;
         if (!msg) return;
         const channelId = e.channelId || msg.channel_id;
-        if (!this.isMonitored(channelId)) return;
+        const source = this.getSource(channelId);
+        if (!source) return;
         if (!this.passesAuthorFilters(msg.author)) return;
 
         this.remember(msg, channelId);
         if (!this.matchesKeywords(msg.content)) return;
-        this.enqueue(this.buildEmbed("create", { msg, channelId, content: msg.content || "", attachments: msg.attachments, stickers: msg.sticker_items }));
+        this.enqueue(
+            this.buildEmbed("create", { msg, channelId, content: msg.content || "", attachments: msg.attachments, stickers: msg.sticker_items }),
+            this.resolveDest(source, "create", msg.content)
+        );
     }
 
     handleUpdate(e) {
@@ -246,7 +318,8 @@ module.exports = class ChannelLogger {
         const msg = e.message;
         if (!msg || typeof msg.content !== "string") return;
         const channelId = msg.channel_id || e.channelId;
-        if (!this.isMonitored(channelId)) return;
+        const source = this.getSource(channelId);
+        if (!source) return;
 
         const cached = this.cache.get(msg.id);
         const author = msg.author || cached?.author;
@@ -262,7 +335,10 @@ module.exports = class ChannelLogger {
         this.cache.set(msg.id, { ...(cached || { timestamp: msg.timestamp, attachments: [] }), channelId, content: msg.content, author });
 
         if (!this.matchesKeywords(msg.content) && !this.matchesKeywords(old)) return;
-        this.enqueue(this.buildEmbed("edit", { msg: { ...msg, author }, channelId, content: msg.content, old, attachments: msg.attachments || cached?.attachments }));
+        this.enqueue(
+            this.buildEmbed("edit", { msg: { ...msg, author }, channelId, content: msg.content, old, attachments: msg.attachments || cached?.attachments }),
+            this.resolveDest(source, "edit", msg.content, old)
+        );
     }
 
     handleDelete(e) {
@@ -275,7 +351,8 @@ module.exports = class ChannelLogger {
 
     logDelete(id, channelId) {
         if (!this.settings.logDeletes) return;
-        if (!this.isMonitored(channelId)) return;
+        const source = this.getSource(channelId);
+        if (!source) return;
         const cached = this.cache.get(id);
         this.cache.delete(id);
 
@@ -292,7 +369,8 @@ module.exports = class ChannelLogger {
                 channelId,
                 content: cached ? cached.content : null,
                 attachments: cached?.attachments,
-            })
+            }),
+            this.resolveDest(source, "delete", cached?.content)
         );
     }
 
@@ -373,18 +451,27 @@ module.exports = class ChannelLogger {
         };
     }
 
-    enqueue(embed) {
-        if (!this.isConfigured()) {
+    // Each log channel has its own queue, because Discord rate limits per channel.
+    enqueue(embed, destKey) {
+        const dest = this.settings.destinations[destKey];
+        const channelId = (dest?.channelId || "").trim();
+        if (!TOKEN_RE.test(this.cleanToken(this.settings.botToken)) || !ID_RE.test(channelId)) {
             if (!this.warnedNotConfigured) {
                 this.warnedNotConfigured = true;
-                UI.showToast("ChannelLogger: set a valid bot token and channel ID first.", { type: "warning" });
+                UI.showToast(`ChannelLogger: set a valid bot token and channel ID${dest ? ` for "${dest.name}"` : ""} first.`, { type: "warning" });
             }
             return;
         }
         this.warnedNotConfigured = false;
-        this.queue.push(embed);
-        if (this.queue.length > QUEUE_LIMIT) this.queue.shift();
-        this.pump();
+        let q = this.queues.get(channelId);
+        if (!q) {
+            q = { name: dest.name, items: [] };
+            this.queues.set(channelId, q);
+        }
+        q.name = dest.name;
+        q.items.push(embed);
+        if (q.items.length > QUEUE_LIMIT) q.items.shift();
+        this.pump(channelId);
     }
 
     hint(status) {
@@ -394,26 +481,28 @@ module.exports = class ChannelLogger {
         return "";
     }
 
-    async pump() {
-        if (this.pumping) return;
-        this.pumping = true;
+    async pump(channelId) {
+        if (this.pumping.has(channelId)) return;
+        const q = this.queues.get(channelId);
+        if (!q) return;
+        this.pumping.add(channelId);
         let failures = 0;
         try {
-            while (this.running && this.queue.length) {
+            while (this.running && q.items.length) {
                 const batch = [];
                 let size = 0;
-                while (this.queue.length && batch.length < 10) {
-                    const s = embedSize(this.queue[0]);
+                while (q.items.length && batch.length < 10) {
+                    const s = embedSize(q.items[0]);
                     if (batch.length && size + s > 5500) break;
                     size += s;
-                    batch.push(this.queue.shift());
+                    batch.push(q.items.shift());
                 }
 
-                const res = await this.send(batch);
+                const res = await this.send(channelId, batch);
                 if (res.ok) {
                     failures = 0;
                 } else if (res.retryAfter) {
-                    this.queue.unshift(...batch);
+                    q.items.unshift(...batch);
                     await sleep(res.retryAfter * 1000 + 100);
                     continue;
                 } else {
@@ -421,12 +510,12 @@ module.exports = class ChannelLogger {
                     if (failures >= 3 || res.fatal) {
                         const extra = this.hint(res.status);
                         UI.showToast(
-                            `ChannelLogger: sending failed${res.status ? ` (HTTP ${res.status})` : ""}${res.detail ? `: ${res.detail}` : ""}${extra ? ` — ${extra}` : ""}`,
+                            `ChannelLogger: sending to "${q.name}" failed${res.status ? ` (HTTP ${res.status})` : ""}${res.detail ? `: ${res.detail}` : ""}${extra ? ` — ${extra}` : ""}`,
                             { type: "error", timeout: 10000 }
                         );
                         failures = 0; // drop the batch
                     } else {
-                        this.queue.unshift(...batch);
+                        q.items.unshift(...batch);
                         await sleep(3000);
                         continue;
                     }
@@ -434,13 +523,13 @@ module.exports = class ChannelLogger {
                 await sleep(1000);
             }
         } finally {
-            this.pumping = false;
+            this.pumping.delete(channelId);
         }
     }
 
-    async send(embeds) {
+    async send(channelId, embeds) {
         try {
-            const res = await netFetch(`${API}/channels/${this.settings.logChannelId.trim()}/messages`, {
+            const res = await netFetch(`${API}/channels/${channelId}/messages`, {
                 method: "POST",
                 headers: this.botHeaders(),
                 body: JSON.stringify({ allowed_mentions: { parse: [] }, embeds }),
@@ -472,15 +561,13 @@ module.exports = class ChannelLogger {
         const channel = props?.channel;
         const children = tree?.props?.children;
         if (!channel?.guild_id || !Array.isArray(children)) return;
-        children.push(
-            ContextMenu.buildItem({ type: "separator" }),
-            ContextMenu.buildItem({
-                type: "toggle",
-                label: channel.type === 4 ? "Log this category" : "Log this channel",
-                checked: !!this.settings.channels[channel.id],
-                action: () => this.toggleChannel(channel),
-            })
-        );
+        const isCategory = channel.type === 4;
+        const makeEntry = () => ({
+            label: `${isCategory ? "📁 " : "#"}${channel.name}`,
+            guildName: this.GuildStore.getGuild(channel.guild_id)?.name || "?",
+            dest: "",
+        });
+        children.push(ContextMenu.buildItem({ type: "separator" }), this.sourceMenuItem("channels", channel.id, isCategory ? "this category" : "this channel", makeEntry));
     }
 
     patchGuildMenu(tree, props) {
@@ -489,38 +576,63 @@ module.exports = class ChannelLogger {
         if (!guild || !Array.isArray(children)) return;
         children.push(
             ContextMenu.buildItem({ type: "separator" }),
-            ContextMenu.buildItem({
-                type: "toggle",
-                label: "Log whole server",
-                checked: !!this.settings.guilds[guild.id],
-                action: () => this.toggleGuild(guild),
-            })
+            this.sourceMenuItem("guilds", guild.id, "whole server", () => ({ label: guild.name, dest: "" }))
         );
     }
 
-    toggleChannel(channel) {
-        const label = `${channel.type === 4 ? "📁 " : "#"}${channel.name}`;
-        if (this.settings.channels[channel.id]) {
-            delete this.settings.channels[channel.id];
-            UI.showToast(`Logging stopped: ${label}`, { type: "info" });
-        } else {
-            const guild = this.GuildStore.getGuild(channel.guild_id);
-            this.settings.channels[channel.id] = { label, guildName: guild?.name || "?" };
-            UI.showToast(`Logging started: ${label}`, { type: "success" });
-            if (!this.isConfigured()) UI.showToast("Note: bot token or channel ID is not set yet.", { type: "warning" });
+    // One toggle when there is a single log channel, a submenu to pick the destination when there are several.
+    sourceMenuItem(store, id, noun, makeEntry) {
+        const current = this.settings[store][id];
+        const dests = Object.entries(this.settings.destinations);
+
+        if (dests.length <= 1) {
+            return ContextMenu.buildItem({
+                type: "toggle",
+                label: `Log ${noun}`,
+                checked: !!current,
+                action: () => this.setSource(store, id, makeEntry, ""),
+            });
         }
+
+        const items = [
+            {
+                type: "toggle",
+                label: `Log to default ("${this.destName(this.settings.defaultDest)}")`,
+                checked: !!current && !current.dest,
+                action: () => this.setSource(store, id, makeEntry, ""),
+            },
+            ...dests.map(([key, d]) => ({
+                type: "toggle",
+                label: `Log to "${d.name}"`,
+                checked: current?.dest === key,
+                action: () => this.setSource(store, id, makeEntry, key),
+            })),
+        ];
+        if (current) {
+            items.push({ type: "separator" }, { type: "text", label: "Stop logging", danger: true, action: () => this.removeSource(store, id) });
+        }
+        return ContextMenu.buildItem({ type: "submenu", label: `ChannelLogger: ${noun}`, items });
+    }
+
+    // Choosing the destination that is already active switches logging off again.
+    setSource(store, id, makeEntry, destKey) {
+        const current = this.settings[store][id];
+        if (current && (current.dest || "") === destKey) {
+            this.removeSource(store, id);
+            return;
+        }
+        const entry = { ...(current || makeEntry()), dest: destKey };
+        this.settings[store][id] = entry;
+        const target = this.destName(destKey || this.settings.defaultDest);
+        UI.showToast(`Logging started: ${entry.label} → ${target}`, { type: "success" });
+        if (!this.isConfigured()) UI.showToast("Note: bot token or channel ID is not set yet.", { type: "warning" });
         this.save();
     }
 
-    toggleGuild(guild) {
-        if (this.settings.guilds[guild.id]) {
-            delete this.settings.guilds[guild.id];
-            UI.showToast(`Logging stopped: ${guild.name}`, { type: "info" });
-        } else {
-            this.settings.guilds[guild.id] = { label: guild.name };
-            UI.showToast(`Logging started for whole server: ${guild.name}`, { type: "success" });
-            if (!this.isConfigured()) UI.showToast("Note: bot token or channel ID is not set yet.", { type: "warning" });
-        }
+    removeSource(store, id) {
+        const entry = this.settings[store][id];
+        delete this.settings[store][id];
+        UI.showToast(`Logging stopped: ${entry?.label || id}`, { type: "info" });
         this.save();
     }
 
@@ -529,68 +641,178 @@ module.exports = class ChannelLogger {
     getSettingsPanel() {
         if (!this.settings) this.loadSettings();
         const root = h("div", { style: "color:var(--text-normal);padding:8px 0" });
-        const inputStyle =
-            "width:100%;padding:8px;border-radius:4px;border:none;box-sizing:border-box;background:var(--background-tertiary,#1e1f22);color:var(--text-normal)";
-        const btnStyle = "padding:6px 12px;border-radius:4px;border:none;cursor:pointer;background:var(--brand-experiment,#5865f2);color:#fff;margin-left:8px";
-        const headStyle = "font-weight:600;margin:16px 0 6px;color:var(--header-primary)";
+        const fieldStyle = "padding:8px;border-radius:4px;border:none;box-sizing:border-box;background:var(--background-tertiary,#1e1f22);color:var(--text-normal)";
+        const inputStyle = `width:100%;${fieldStyle}`;
+        const btnStyle = "padding:6px 12px;border-radius:4px;border:none;cursor:pointer;background:var(--brand-experiment,#5865f2);color:#fff;margin-left:8px;white-space:nowrap";
+        const dangerStyle = btnStyle.replace("var(--brand-experiment,#5865f2)", "#da373c");
+        const headStyle = "font-weight:600;margin:18px 0 6px;color:var(--header-primary)";
         const noteStyle = "font-size:12px;opacity:.7;margin-top:4px";
+        const rowStyle = "display:flex;align-items:center;gap:8px;margin:6px 0";
+
+        const select = (options, value, onChange, style = "") => {
+            const sel = h("select", { style: `${fieldStyle};${style}` });
+            for (const [v, l] of options) sel.append(h("option", { value: v }, l));
+            sel.value = value;
+            sel.addEventListener("change", () => onChange(sel.value));
+            return sel;
+        };
+        const destOptions = (noneLabel) => [
+            ...(noneLabel ? [["", noneLabel]] : []),
+            ...Object.entries(this.settings.destinations).map(([k, d]) => [k, d.name || "(unnamed)"]),
+        ];
+        const toggle = (key, label) => {
+            const cb = h("input", { type: "checkbox", checked: !!this.settings[key] });
+            cb.addEventListener("change", () => {
+                this.settings[key] = cb.checked;
+                this.save();
+            });
+            return h("label", { style: "display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer" }, cb, label);
+        };
 
         const render = () => {
             root.innerHTML = "";
+            const s = this.settings;
 
-            // Bot token (hidden input)
-            const tokenInput = h("input", { type: "password", value: this.settings.botToken, placeholder: "Bot token", style: inputStyle, autocomplete: "off" });
+            /* Bot token */
+            const tokenInput = h("input", { type: "password", value: s.botToken, placeholder: "Bot token", style: inputStyle, autocomplete: "off" });
             tokenInput.addEventListener("change", () => {
-                this.settings.botToken = this.cleanToken(tokenInput.value);
-                tokenInput.value = this.settings.botToken;
+                s.botToken = this.cleanToken(tokenInput.value);
+                tokenInput.value = s.botToken;
                 this.save();
-                if (this.settings.botToken && !TOKEN_RE.test(this.settings.botToken)) UI.showToast("This does not look like a valid bot token.", { type: "error" });
+                if (s.botToken && !TOKEN_RE.test(s.botToken)) UI.showToast("This does not look like a valid bot token.", { type: "error" });
             });
-
-            // Channel ID
-            const chanInput = h("input", { type: "text", value: this.settings.logChannelId, placeholder: "ID of your log channel", style: inputStyle });
-            chanInput.addEventListener("change", () => {
-                this.settings.logChannelId = chanInput.value.trim();
-                chanInput.value = this.settings.logChannelId;
-                this.save();
-                if (this.settings.logChannelId && !ID_RE.test(this.settings.logChannelId)) UI.showToast("This does not look like a valid channel ID.", { type: "error" });
-            });
-
-            const testBtn = h("button", { style: btnStyle, onclick: () => this.sendTest() }, "Send test");
-            const diagBtn = h(
-                "button",
-                {
-                    style: btnStyle,
-                    onclick: async (ev) => {
-                        ev.target.disabled = true;
-                        ev.target.textContent = "Working…";
-                        await this.runDiagnose();
-                        render();
-                    },
-                },
-                "Diagnose"
-            );
-
             root.append(
                 h("div", { style: headStyle }, "Bot token"),
                 tokenInput,
-                h("div", { style: noteStyle }, "Stored unencrypted in the plugin data on your computer. Share it with no one and reset it in the Developer Portal if it leaks."),
-                h("div", { style: headStyle }, "Channel ID of your log channel"),
-                h("div", { style: "display:flex;align-items:center" }, chanInput, testBtn, diagBtn),
-                h("div", { style: noteStyle }, "Turn on Developer Mode, right-click the log channel and choose 'Copy Channel ID'."),
+                h("div", { style: noteStyle }, "Stored unencrypted in the plugin data on your computer. Share it with no one and reset it in the Developer Portal if it leaks.")
+            );
+
+            /* Log channels */
+            root.append(h("div", { style: headStyle }, "Log channels"));
+            const destEntries = Object.entries(s.destinations);
+            if (!destEntries.length) root.append(h("div", { style: "opacity:.7" }, "No log channel yet. Add one below."));
+            for (const [key, d] of destEntries) {
+                const nameInput = h("input", { type: "text", value: d.name, placeholder: "Name (e.g. Giveaways)", style: `${fieldStyle};width:30%` });
+                nameInput.addEventListener("change", () => {
+                    d.name = nameInput.value.trim() || "Unnamed";
+                    this.save();
+                    render();
+                });
+                const idInput = h("input", { type: "text", value: d.channelId, placeholder: "Channel ID", style: `${fieldStyle};flex:1;min-width:0` });
+                idInput.addEventListener("change", () => {
+                    d.channelId = idInput.value.trim();
+                    idInput.value = d.channelId;
+                    this.save();
+                    if (d.channelId && !ID_RE.test(d.channelId)) UI.showToast("This does not look like a valid channel ID.", { type: "error" });
+                });
+                const radio = h("input", { type: "radio", name: "channellogger-default", checked: s.defaultDest === key });
+                radio.addEventListener("change", () => {
+                    s.defaultDest = key;
+                    this.save();
+                    render();
+                });
+                root.append(
+                    h(
+                        "div",
+                        { style: rowStyle },
+                        nameInput,
+                        idInput,
+                        h("label", { style: "display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer" }, radio, "Default"),
+                        h("button", { style: btnStyle, onclick: () => this.sendTest(key) }, "Test"),
+                        h("button", { style: dangerStyle, onclick: () => { delete s.destinations[key]; this.save(); render(); } }, "Remove")
+                    )
+                );
+            }
+            root.append(
+                h(
+                    "div",
+                    { style: "display:flex;align-items:center;margin-top:8px" },
+                    h(
+                        "button",
+                        {
+                            style: btnStyle.replace("margin-left:8px;", ""),
+                            onclick: () => {
+                                const key = newKey();
+                                s.destinations[key] = { name: `Log ${Object.keys(s.destinations).length + 1}`, channelId: "" };
+                                if (!s.defaultDest) s.defaultDest = key;
+                                this.save();
+                                render();
+                            },
+                        },
+                        "Add log channel"
+                    ),
+                    h(
+                        "button",
+                        {
+                            style: btnStyle,
+                            onclick: async (ev) => {
+                                ev.target.disabled = true;
+                                ev.target.textContent = "Working…";
+                                await this.runDiagnose();
+                                render();
+                            },
+                        },
+                        "Diagnose"
+                    )
+                ),
+                h("div", { style: noteStyle }, "Turn on Developer Mode, right-click a log channel and choose 'Copy Channel ID'. The default log channel is used when nothing below says otherwise."),
                 this.diagText
                     ? h("pre", { style: "white-space:pre-wrap;user-select:text;margin-top:8px;padding:8px;border-radius:4px;font-size:12px;background:var(--background-tertiary,#1e1f22)" }, this.diagText)
                     : ""
             );
 
-            const toggle = (key, label) => {
-                const cb = h("input", { type: "checkbox", checked: !!this.settings[key] });
-                cb.addEventListener("change", () => {
-                    this.settings[key] = cb.checked;
+            /* Routing */
+            root.append(
+                h("div", { style: headStyle }, "Routing"),
+                h("div", { style: noteStyle }, "Priority: keyword routes, then the edited/deleted overrides, then the log channel chosen for the logged channel, category or server, then the default.")
+            );
+            const noDests = !Object.keys(s.destinations).length;
+            for (const [ev, label] of [["edit", "Edited messages go to"], ["delete", "Deleted messages go to"]]) {
+                root.append(
+                    h(
+                        "div",
+                        { style: rowStyle },
+                        h("span", { style: "min-width:190px" }, label),
+                        select(destOptions("Same as the channel's log channel"), s.eventRoutes[ev] || "", (v) => { s.eventRoutes[ev] = v; this.save(); }, "flex:1")
+                    )
+                );
+            }
+            root.append(h("div", { style: "font-weight:600;margin:12px 0 4px" }, "Keyword routes"));
+            if (!s.keywordRoutes.length) root.append(h("div", { style: "opacity:.7" }, "None. Messages containing these keywords are sent to the chosen log channel instead."));
+            s.keywordRoutes.forEach((r, i) => {
+                const kw = h("input", { type: "text", value: r.keywords, placeholder: "e.g. giveaway, nitro", style: `${fieldStyle};flex:1;min-width:0` });
+                kw.addEventListener("change", () => {
+                    r.keywords = kw.value;
                     this.save();
                 });
-                return h("label", { style: "display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer" }, cb, label);
-            };
+                root.append(
+                    h(
+                        "div",
+                        { style: rowStyle },
+                        kw,
+                        h("span", {}, "→"),
+                        select(destOptions(""), r.dest, (v) => { r.dest = v; this.save(); }, "width:35%"),
+                        h("button", { style: dangerStyle, onclick: () => { s.keywordRoutes.splice(i, 1); this.save(); render(); } }, "Remove")
+                    )
+                );
+            });
+            root.append(
+                h(
+                    "button",
+                    {
+                        style: btnStyle.replace("margin-left:8px;", "") + ";margin-top:6px",
+                        disabled: noDests,
+                        onclick: () => {
+                            s.keywordRoutes.push({ keywords: "", dest: s.defaultDest || Object.keys(s.destinations)[0] });
+                            this.save();
+                            render();
+                        },
+                    },
+                    "Add keyword route"
+                )
+            );
+
+            /* Options */
             root.append(
                 h("div", { style: headStyle }, "Options"),
                 toggle("logEdits", "Log edited messages"),
@@ -598,30 +820,32 @@ module.exports = class ChannelLogger {
                 toggle("ignoreBots", "Ignore messages from bots"),
                 toggle("ignoreSelf", "Ignore my own messages")
             );
-
-            const kw = h("input", { type: "text", value: this.settings.keywords, placeholder: "e.g. giveaway, update (empty = log everything)", style: inputStyle });
-            kw.addEventListener("change", () => {
-                this.settings.keywords = kw.value;
+            const kwFilter = h("input", { type: "text", value: s.keywords, placeholder: "e.g. giveaway, update (empty = log everything)", style: inputStyle });
+            kwFilter.addEventListener("change", () => {
+                s.keywords = kwFilter.value;
                 this.save();
             });
-            root.append(h("div", { style: headStyle }, "Keywords (comma-separated)"), kw);
+            root.append(h("div", { style: headStyle }, "Only log messages containing (comma-separated)"), kwFilter);
 
-            const list = (title, obj, labelFn, key) => {
-                const ids = Object.keys(obj);
-                const items = ids.length
-                    ? ids.map((id) =>
-                          h(
+            /* Logged sources */
+            const list = (title, store, labelFn) => {
+                const ids = Object.keys(s[store]);
+                const rows = ids.length
+                    ? ids.map((id) => {
+                          const entry = s[store][id];
+                          return h(
                               "div",
-                              { style: "display:flex;justify-content:space-between;align-items:center;padding:4px 0" },
-                              h("span", {}, labelFn(obj[id])),
-                              h("button", { style: btnStyle, onclick: () => { delete this.settings[key][id]; this.save(); render(); } }, "Remove")
-                          )
-                      )
+                              { style: rowStyle },
+                              h("span", { style: "flex:1" }, labelFn(entry)),
+                              select(destOptions(`Default ("${this.destName(s.defaultDest)}")`), entry.dest || "", (v) => { entry.dest = v; this.save(); }, "width:38%"),
+                              h("button", { style: dangerStyle, onclick: () => { delete s[store][id]; this.save(); render(); } }, "Remove")
+                          );
+                      })
                     : [h("div", { style: "opacity:.7" }, "Nothing yet. Right-click a channel or server.")];
-                root.append(h("div", { style: headStyle }, title), ...items);
+                root.append(h("div", { style: headStyle }, title), ...rows);
             };
-            list("Logged channels / categories", this.settings.channels, (c) => `${c.guildName} › ${c.label}`, "channels");
-            list("Fully logged servers", this.settings.guilds, (g) => g.label, "guilds");
+            list("Logged channels / categories", "channels", (c) => `${c.guildName} › ${c.label}`);
+            list("Fully logged servers", "guilds", (g) => g.label);
         };
 
         render();
@@ -630,21 +854,24 @@ module.exports = class ChannelLogger {
 
     /* ---------- test & diagnose ---------- */
 
-    sendTest() {
+    sendTest(destKey) {
         if (!this.running) return UI.showToast("Plugin is not running.", { type: "error" });
-        this.enqueue({
-            title: "ChannelLogger test",
-            description: "If you see this, the bot works.",
-            color: COLORS.info,
-            timestamp: new Date().toISOString(),
-        });
+        this.enqueue(
+            {
+                title: "ChannelLogger test",
+                description: `If you see this, the bot works. Log channel: ${this.destName(destKey)}`,
+                color: COLORS.info,
+                timestamp: new Date().toISOString(),
+            },
+            destKey
+        );
     }
 
     async runDiagnose() {
         const lines = [];
         const add = (t) => lines.push(t);
         add(`Plugin: ${this.meta?.version || "?"} | BetterDiscord: ${BdApi.version ?? "unknown"} | Net.fetch: ${typeof BdApi.Net?.fetch}`);
-        add(`Token format valid: ${TOKEN_RE.test(this.cleanToken(this.settings.botToken))} | Channel ID format valid: ${ID_RE.test((this.settings.logChannelId || "").trim())}`);
+        add(`Token format valid: ${TOKEN_RE.test(this.cleanToken(this.settings.botToken))}`);
 
         const oneLine = (t) => String(t).replace(/\s+/g, " ").slice(0, 150);
         const attempt = async (label, fn, fmt) => {
@@ -659,30 +886,36 @@ module.exports = class ChannelLogger {
         };
         const json = (t) => { try { return JSON.parse(t); } catch (_) { return null; } };
 
-        if (typeof BdApi.Net?.fetch === "function") {
-            if (this.isConfigured()) {
-                const id = this.settings.logChannelId.trim();
-                await attempt("A. Who is the bot (GET /users/@me)", () => netFetch(`${API}/users/@me`, { headers: this.botHeaders() }), (t) => {
-                    const j = json(t);
-                    return j?.username ? `bot=${j.username}` : oneLine(t);
-                });
-                await attempt("B. Look up log channel (GET /channels/{id})", () => netFetch(`${API}/channels/${id}`, { headers: this.botHeaders() }), (t) => {
+        if (typeof BdApi.Net?.fetch === "function" && TOKEN_RE.test(this.cleanToken(this.settings.botToken))) {
+            await attempt("A. Who is the bot (GET /users/@me)", () => netFetch(`${API}/users/@me`, { headers: this.botHeaders() }), (t) => {
+                const j = json(t);
+                return j?.username ? `bot=${j.username}` : oneLine(t);
+            });
+            const dests = Object.values(this.settings.destinations);
+            if (!dests.length) add("No log channels configured.");
+            for (const d of dests) {
+                const id = (d.channelId || "").trim();
+                if (!ID_RE.test(id)) {
+                    add(`"${d.name}": channel ID format is not valid`);
+                    continue;
+                }
+                await attempt(`"${d.name}" look up (GET /channels/{id})`, () => netFetch(`${API}/channels/${id}`, { headers: this.botHeaders() }), (t) => {
                     const j = json(t);
                     return j?.name ? `channel=#${j.name} type=${j.type}` : oneLine(t);
                 });
                 await attempt(
-                    "C. Post test message (POST /channels/{id}/messages)",
+                    `"${d.name}" post test (POST /channels/{id}/messages)`,
                     () =>
                         netFetch(`${API}/channels/${id}/messages`, {
                             method: "POST",
                             headers: this.botHeaders(),
-                            body: JSON.stringify({ embeds: [{ title: "ChannelLogger diagnose", description: "This request went through.", color: COLORS.info }] }),
+                            body: JSON.stringify({ embeds: [{ title: "ChannelLogger diagnose", description: `This request went through (${d.name}).`, color: COLORS.info }] }),
                         }),
                     (t) => (json(t)?.id ? "message posted" : oneLine(t))
                 );
-            } else {
-                add("Fill in a valid bot token and channel ID first.");
             }
+        } else {
+            add("Fill in a valid bot token first.");
         }
 
         this.diagText = lines.join("\n");
