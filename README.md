@@ -6,7 +6,8 @@ Reading happens in your Discord client (the plugin only sees what your client al
 
 ## Features
 
-- Right-click a channel, category or server to start or stop logging it
+- Right-click a channel, category or server to start or stop logging it, and pick **which log channel** it goes to
+- **Multiple log channels** with routing rules: per source, per event (edits / deletes) and per keyword
 - Logs new messages, edits (old and new text) and deletions
 - Attachments as links, a link back to the original message, author, server and channel
 - Filters: ignore bots, ignore your own messages, keyword filter
@@ -33,11 +34,24 @@ Reading happens in your Discord client (the plugin only sees what your client al
 4. Open the generated link and invite the bot to **your own** server.
 5. Make sure the bot can write in your log channel.
 6. Turn on Developer Mode in Discord (Settings → Advanced), right-click the log channel and choose *Copy Channel ID*.
-7. Open the plugin settings, paste the bot token and the channel ID, and press **Diagnose**. Steps A, B and C should succeed.
+7. Open the plugin settings, paste the bot token, press **Add log channel**, give it a name and paste the channel ID. Press **Diagnose**: the bot check and, for every log channel, the lookup and the test post should succeed.
 
 ## Usage
 
-Right-click a channel, category or server and toggle **Log this channel** / **Log this category** / **Log whole server**. Everything that is being logged is listed in the plugin settings.
+Right-click a channel, category or server and choose where to log it. With a single log channel this is one toggle; with several it is a submenu (**Log to default**, **Log to "Name"**, **Stop logging**). Everything that is being logged is listed in the plugin settings, where you can also change the log channel per entry.
+
+## Multiple log channels and routing
+
+Add as many log channels as you like (each is a channel in your own server that your bot can write to) and mark one as the **default**. For every message the log channel is chosen in this order, first match wins:
+
+1. **Keyword routes**: if the message contains one of the route's keywords (comma-separated, case-insensitive), it goes to that route's log channel.
+2. **Event override**: edited and deleted messages can be sent to their own log channel, for example a dedicated "deletes" channel.
+3. **The log channel chosen for the logged channel, category or server** (right-click menu or the list in the settings).
+4. **The default log channel.**
+
+Example: log a whole server to "General", send everything containing `giveaway` or `nitro` to "Giveaways", and send all deleted messages to "Deletes".
+
+Settings from version 1.1.x are migrated automatically: the old single log channel becomes your default log channel.
 
 ## Limitations
 
