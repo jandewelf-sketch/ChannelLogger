@@ -2,7 +2,7 @@
  * @name ChannelLogger
  * @author jandewelf-sketch
  * @description Logs new, edited and deleted messages from chosen server channels to one or more log channels in your own server, using your own Discord bot.
- * @version 1.2.0
+ * @version 1.3.0
  */
 
 const { Data, UI, ContextMenu, Webpack } = BdApi;
@@ -11,7 +11,7 @@ const COLORS = { create: 0x57f287, edit: 0xfee75c, delete: 0xed4245, info: 0x586
 const CACHE_LIMIT = 2000;
 const QUEUE_LIMIT = 1000;
 const API = "https://discord.com/api/v10";
-const UA = "DiscordBot (ChannelLogger, 1.2.0)";
+const UA = "DiscordBot (ChannelLogger, 1.3.0)";
 const TOKEN_RE = /^[\w-]{18,}\.[\w-]{5,}\.[\w-]{20,}$/;
 const ID_RE = /^\d{17,20}$/;
 
@@ -23,6 +23,13 @@ const embedSize = (e) =>
     (e.author?.name?.length || 0) +
     (e.footer?.text?.length || 0) +
     (e.fields || []).reduce((n, f) => n + f.name.length + f.value.length, 0);
+// Images that can be shown inside an embed. Spoilers and SVGs stay plain links.
+const isEmbeddableImage = (a) => {
+    const name = (a.filename || "").split("?")[0];
+    if (/^SPOILER_/i.test(name) || /svg/i.test(a.content_type || "") || /\.svg$/i.test(name)) return false;
+    return /^image\//i.test(a.content_type || "") || /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(name);
+};
+const MAX_GALLERY = 4; // Discord merges up to 4 embeds with the same url into one image grid
 const newKey = () => "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
 
 const h = (tag, attrs = {}, ...kids) => {
@@ -405,15 +412,18 @@ module.exports = class ChannelLogger {
 
         const stickerText = (stickers || []).map((s) => `*(sticker: ${s.name})*`).join(" ");
         const placeholder = "*(no text — embed, attachment or sticker)*";
+        const hasAttachments = !!attachments?.length;
         let description;
 
         if (kind === "edit") {
             const oldText = old === null ? "*(unknown — not in cache)*" : cut(old || "*(empty)*", 1800);
-            description = `**New**\n${cut(content || placeholder, 1800)}\n\n**Old**\n${oldText}`;
+            description = `**New**\n${cut(content || (hasAttachments ? "*(no text)*" : placeholder), 1800)}\n\n**Old**\n${oldText}`;
         } else if (kind === "delete") {
-            description = content === null ? "*(content unknown — message was not in cache)*" : cut(content || placeholder, 3800);
+            const body = content === null ? "*(content unknown — message was not in cache)*" : content || (hasAttachments ? "" : placeholder);
+            description = body ? cut(body, 3800) : undefined;
         } else {
-            description = cut([content, stickerText].filter(Boolean).join("\n") || placeholder, 3800);
+            const body = [content, stickerText].filter(Boolean).join("\n") || (hasAttachments ? "" : placeholder);
+            description = body ? cut(body, 3800) : undefined;
         }
 
         const embed = {
@@ -431,14 +441,31 @@ module.exports = class ChannelLogger {
             embed.url = `https://discord.com/channels/${channel.guild_id}/${channelId}/${msg.id}`;
         }
 
-        if (attachments?.length) {
-            const lines = attachments.map((a) => `[${a.filename || "attachment"}](${a.url})`).join("\n");
+        // Images are shown inside the embed. Discord merges embeds that share the same url into one
+        // image grid (up to 4 per grid), so every image gets its own embed with the same url.
+        const images = [];
+        const files = [];
+        for (const a of attachments || []) (isEmbeddableImage(a) && images.length < 10 ? images : files).push(a);
+
+        if (files.length) {
+            const lines = files.map((a) => `[${a.filename || "attachment"}](${a.url})`).join("\n");
             embed.fields = [{ name: "Attachments", value: cut(lines, 1000) }];
-            const img = attachments.find((a) => a.content_type?.startsWith("image/"));
-            if (img) embed.image = { url: img.url };
         }
 
-        return embed;
+        const group = [embed];
+        if (images.length) {
+            embed.image = { url: images[0].url };
+            if (images.length > 1) {
+                if (!embed.url) embed.url = channel?.guild_id ? `https://discord.com/channels/${channel.guild_id}/${channelId}` : "https://discord.com/channels/@me";
+                for (let i = 1; i < images.length; i++) {
+                    const part = Math.floor(i / MAX_GALLERY);
+                    const url = part === 0 ? embed.url : `${embed.url}${embed.url.includes("?") ? "&" : "?"}part=${part}`;
+                    group.push({ url, image: { url: images[i].url }, color: embed.color });
+                }
+            }
+        }
+
+        return group;
     }
 
     /* ---------- sending via the bot ---------- */
@@ -452,7 +479,8 @@ module.exports = class ChannelLogger {
     }
 
     // Each log channel has its own queue, because Discord rate limits per channel.
-    enqueue(embed, destKey) {
+    enqueue(embedOrGroup, destKey) {
+        const group = Array.isArray(embedOrGroup) ? embedOrGroup : [embedOrGroup];
         const dest = this.settings.destinations[destKey];
         const channelId = (dest?.channelId || "").trim();
         if (!TOKEN_RE.test(this.cleanToken(this.settings.botToken)) || !ID_RE.test(channelId)) {
@@ -469,7 +497,7 @@ module.exports = class ChannelLogger {
             this.queues.set(channelId, q);
         }
         q.name = dest.name;
-        q.items.push(embed);
+        q.items.push(group); // a group is never split over two messages, or the image grid would break
         if (q.items.length > QUEUE_LIMIT) q.items.shift();
         this.pump(channelId);
     }
@@ -489,20 +517,23 @@ module.exports = class ChannelLogger {
         let failures = 0;
         try {
             while (this.running && q.items.length) {
-                const batch = [];
+                const groups = [];
                 let size = 0;
-                while (q.items.length && batch.length < 10) {
-                    const s = embedSize(q.items[0]);
-                    if (batch.length && size + s > 5500) break;
-                    size += s;
-                    batch.push(q.items.shift());
+                let count = 0;
+                while (q.items.length) {
+                    const g = q.items[0];
+                    const gs = g.reduce((n, e) => n + embedSize(e), 0);
+                    if (count > 0 && (count + g.length > 10 || size + gs > 5500)) break;
+                    size += gs;
+                    count += g.length;
+                    groups.push(q.items.shift());
                 }
 
-                const res = await this.send(channelId, batch);
+                const res = await this.send(channelId, groups.flat());
                 if (res.ok) {
                     failures = 0;
                 } else if (res.retryAfter) {
-                    q.items.unshift(...batch);
+                    q.items.unshift(...groups);
                     await sleep(res.retryAfter * 1000 + 100);
                     continue;
                 } else {
@@ -515,7 +546,7 @@ module.exports = class ChannelLogger {
                         );
                         failures = 0; // drop the batch
                     } else {
-                        q.items.unshift(...batch);
+                        q.items.unshift(...groups);
                         await sleep(3000);
                         continue;
                     }
