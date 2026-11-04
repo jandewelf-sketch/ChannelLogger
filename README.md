@@ -9,7 +9,8 @@ Reading happens in your Discord client (the plugin only sees what your client al
 - Right-click a channel, category or server to start or stop logging it, and pick **which log channel** it goes to
 - **Multiple log channels** with routing rules: per source, per event (edits / deletes) and per keyword
 - Logs new messages, edits (old and new text) and deletions
-- Attachments as links, a link back to the original message, author, server and channel
+- Images are shown directly inside the log embed (as an image grid, up to 4 per grid); other attachments are listed as links
+- A link back to the original message, plus author, server and channel
 - Filters: ignore bots, ignore your own messages, keyword filter
 - Send queue with rate-limit handling, mentions in logs never ping anyone
 - Built-in **Diagnose** button to check bot, channel and permissions
@@ -57,7 +58,9 @@ Settings from version 1.1.x are migrated automatically: the old single log chann
 
 - Edited or deleted messages only show their old content if the message was posted while the plugin was running (in-memory cache of the last 2000 messages).
 - Messages longer than ~3800 characters are truncated; the link to the original is included.
-- Attachment links expire after a while, so images in old logs may stop loading.
+- Images are displayed from the original Discord attachment links. Those links can expire, so images in old logs may stop loading at some point.
+- Videos and other files cannot be shown inside an embed and are listed as links. Attachments marked as spoiler are also kept as links, so they stay hidden.
+- More than 4 images in one message are shown as several image grids below each other (Discord allows at most 10 attachments per message).
 
 ## Security and privacy
 
